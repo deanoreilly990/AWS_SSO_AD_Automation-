@@ -1,0 +1,270 @@
+## Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+## SPDX-License-Identifier: MIT-0
+Parameters:
+    SSODomainInstanceArn:
+        Type: String
+        Description: Enter your AWS SSO Domain Instance ARN. This can be found in the Settings tab of the  AWS SSO Console. 
+    InstanceStore:
+        Type: String
+        Description: Enter your Instance Store ID. This is the Instance Store ID of the Directory which you have attached to your AWS SSO. 
+    SSODomainName:
+        Type: String
+        Description: Enter the Domain Name for the Active Directory you are using with your AWS SSO.
+    CWEventRule:
+        Type: String
+        Description: Please select from the drop down menu how often you would like this solution to run. 
+        AllowedValues: 
+        - rate(10 minutes)
+        - rate(2 hour)
+        - rate(1 day)
+        - rate(7 days)
+    OwnerEmail:
+        Type: String
+        Description: Please enter the email address you would like all notifications to be sent to. 
+    S3BucketName:
+        Type: String
+        Description: Please enter the S3 Bucket name that contains the Lambda functions. 
+    LambdaCheckKey:
+        Type: String
+        Description: If you have changed the zip file name, please change the below value. 
+        Default: 'checkpermission.zip'
+    LambdaSetKey:
+        Type: String
+        Description: If you have changed the zip file name, please change the below value. 
+        Default: 'setpermission.zip'
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Required Entry"
+        Parameters:
+        - OwnerEmail
+        - S3BucketName
+        - LambdaSetKey
+        - LambdaCheckKey
+        - CWEventRule
+        - InstanceStore
+        - SSODomainName
+        - SSODomainInstanceArn
+    ParameterLabels: 
+      OwnerEmail: 
+        default: "What is your primary email address to respond?"
+      S3BucketName:
+        default: "S3 Bucket name you uploaded the zip files to?"
+      CWEventRule:
+        default: "How often would you like this solution to execute?"
+      InstanceStore:
+        default: "The Instance Store ID of the Directory which you have attached to your AWS SSO?"
+      SSODomainInstanceArn:
+        default: "Enter your AWS SSO Domain Instance ARN:"
+
+
+Resources:
+    SSOPermissionSetViewOnlyAccess:
+        Type: AWS::SSO::PermissionSet
+        Properties: 
+            Description: "View only access for members"
+            InstanceArn: !Ref SSODomainInstanceArn
+            ManagedPolicies: 
+                - arn:aws:iam::aws:policy/job-function/ViewOnlyAccess
+            Name: AutoViewOnlyAccess 
+    SSOPermissionSetAdminOnlyAccess:
+        Type: AWS::SSO::PermissionSet
+        Properties: 
+            Description: "Admin access for  members allows for new resources to be created but no existing CloudFormation Resources to be deleted or changed. "
+            InstanceArn: !Ref SSODomainInstanceArn
+            Name: AutoAdminAccess
+            InlinePolicy: |
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Deny",
+                            "Action": [
+                                "cloudformation:DeleteStackInstances",
+                                "cloudformation:DeleteStack",
+                                "cloudformation:UpdateStack",
+                                "cloudformation:UpdateStackSet",
+                                "cloudformation:DeleteStackSet",
+                                "cloudformation:DeleteChangeSet"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": "*",
+                            "Resource": "*"
+                        }
+                    ]
+                }      
+    ADGroupAdminTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        Subscription:
+        - Endpoint: !Ref OwnerEmail
+          Protocol: email
+    EventRuleRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'events.amazonaws.com'
+            Action: 'sts:AssumeRole'
+        Policies:
+        - PolicyName: lambda
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action: 'states:StartExecution'
+              Resource:
+              - !Ref ADAutoStateMachine
+    ADCronTab:
+      Type: AWS::Events::Rule
+      Properties: 
+        Description: "CronTab Event used in the AD Group Automation Solution "
+        Name: "AD-Automation-Crontab"
+        ScheduleExpression: !Ref CWEventRule
+        State: ENABLED
+        Targets: 
+          - 
+            Arn: !Ref ADAutoStateMachine
+            Id: CloudWatchEventRule
+            RoleArn: !GetAtt "EventRuleRole.Arn"
+    CheckPermissionSetsAccountsRole: 
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+            - sts:AssumeRole
+        Path: "/"
+        Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:*
+              Resource: arn:aws:logs:*:*:*
+        ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+    CheckAccountPolicy: 
+      Type: "AWS::IAM::Policy"
+      Properties: 
+        PolicyName: "root"
+        PolicyDocument: 
+          Version: '2012-10-17'
+          Statement:
+          - Sid: VisualEditor0
+            Effect: Allow
+            Action:
+            - sso:ListAccountAssignments
+            - organizations:ListAccounts
+            - sso:CreateAccountAssignment
+            - sns:Publish
+            - sso:ListPermissionSetsProvisionedToAccount
+            - identitystore:ListGroups
+            Resource: "*"
+        Roles: 
+        - 
+          !Ref "CheckPermissionSetsAccountsRole"
+    CheckPermissionSetsAccountsLambda:
+        Type: AWS::Lambda::Function
+        Properties: 
+          Runtime: python3.8
+          Role: !GetAtt "CheckPermissionSetsAccountsRole.Arn"
+          Handler: Ad_Auto_Check_Permission_Sets.lambda_handler
+          Timeout: 200
+          Environment:
+            Variables:
+              InstanceStoreID: !Ref InstanceStore
+              DomainName: !Ref SSODomainName
+              SSOPermissionSetAdminOnlyAccess: !GetAtt SSOPermissionSetAdminOnlyAccess.PermissionSetArn
+              SSOPermissionSetViewOnlyAccess: !GetAtt SSOPermissionSetViewOnlyAccess.PermissionSetArn
+              TopicARN: !Ref ADGroupAdminTopic
+              SSOInstance: !Ref SSODomainInstanceArn
+          Code: 
+            S3Bucket: !Ref S3BucketName
+            S3Key: !Ref LambdaCheckKey
+    SetPermissionSetAssignmentLambda:
+      Type: AWS::Lambda::Function
+      Properties: 
+        Runtime: python3.8
+        Role: !GetAtt "CheckPermissionSetsAccountsRole.Arn"
+        Handler: Ad_Auto_Set_Permission_Sets.lambda_handler
+        Timeout: 200
+        Environment:
+          Variables:
+            InstanceStoreID: !Ref InstanceStore
+            DomainName: !Ref SSODomainName
+            SSOInstance: !Ref SSODomainInstanceArn
+            SSOPermissionSetAdminOnlyAccess: !GetAtt  SSOPermissionSetAdminOnlyAccess.PermissionSetArn
+            SSOPermissionSetViewOnlyAccess: !GetAtt  SSOPermissionSetViewOnlyAccess.PermissionSetArn
+            TopicARN: !Ref ADGroupAdminTopic
+        Code: 
+            S3Bucket: !Ref S3BucketName
+            S3Key: !Ref LambdaSetKey
+    PSAssignmentStateMachineRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'states.${AWS::Region}.amazonaws.com'
+            Action: 'sts:AssumeRole'
+        Policies:
+        - PolicyName: lambda
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action: 'lambda:InvokeFunction'
+              Resource:
+              - !GetAtt 'SetPermissionSetAssignmentLambda.Arn'
+              - !GetAtt 'CheckPermissionSetsAccountsLambda.Arn'
+    ADAutoStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: AccountAssignmentStateMachine-auto
+        DefinitionString: 
+          !Sub |
+            {
+              "Comment": "Kicking off Execution",
+              "StartAt": "Hello",
+              "States": {
+                "Hello": {
+                  "Type": "Pass",
+                  "Result": "Hello",
+                  "Next": "Check_Account_Status"
+                },
+                "Check_Account_Status": {
+                  "Type": "Task",
+                  "Resource": "${CheckPermissionSetsAccountsLambda.Arn}",
+                  "Next": "wait_30_minutes_AC"
+                },
+                "wait_30_minutes_AC": {
+                  "Type": "Wait",
+                  "Seconds": 1800,
+                  "Next": "Set_permissions"
+                },
+                "Set_permissions": {
+                  "Type": "Task",
+                  "Resource": "${SetPermissionSetAssignmentLambda.Arn}",
+                  "End": true
+                  }
+                }
+            }
+        RoleArn: !GetAtt "PSAssignmentStateMachineRole.Arn"
+
